@@ -7,6 +7,18 @@ All notable changes to the Specify CLI and templates are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.23] - 2025-11-30
+
+- Add comprehensive multi-project support with isolated feature numbering ranges
+- Implement project configuration system with YAML files in `.specify/projects/`
+- Add project-aware template resolution with project-specific overrides
+- Update bash and PowerShell scripts for multi-project feature creation
+- Add new CLI commands: `project init/list/switch/config` and `migrate`
+- Support per-project number ranges (001-099, 100-199, 200-299, etc.)
+- Add migration tools for existing single-project setups
+- Maintain full backward compatibility with existing workflows
+- Update documentation with multi-project usage examples
+
 ## [0.0.22] - 2025-11-07
 
 - Support for VS Code/Copilot agents, and moving away from prompts to proper agents with hand-offs.
