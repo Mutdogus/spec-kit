@@ -164,6 +164,9 @@ The `specify` command supports the following options:
 |-------------|----------------------------------------------------------------|
 | `init`      | Initialize a new Specify project from the latest template      |
 | `check`     | Check for installed tools (`git`, `claude`, `gemini`, `code`/`code-insiders`, `cursor-agent`, `windsurf`, `qwen`, `opencode`, `codex`, `shai`) |
+| `project`   | Manage multi-project configurations (init, list, switch, config) |
+| `migrate`   | Migrate existing single-project setup to multi-project structure |
+| `version`   | Display version and system information |
 
 ### `specify init` Arguments & Options
 
@@ -261,6 +264,109 @@ Additional commands for enhanced quality and validation:
 | Variable         | Description                                                                                    |
 |------------------|------------------------------------------------------------------------------------------------|
 | `SPECIFY_FEATURE` | Override feature detection for non-Git repositories. Set to the feature directory name (e.g., `001-photo-albums`) to work on a specific feature when not using Git branches.<br/>**Must be set in the context of the agent you're working with prior to using `/speckit.plan` or follow-up commands. |
+
+## 🌐 Multi-Project Support
+
+Spec Kit now supports managing multiple projects within a single repository with isolated feature numbering and templates.
+
+### Multi-Project Commands
+
+| Command | Description |
+|---------|-------------|
+| `specify project init <name>` | Create a new project configuration |
+| `specify project list` | List all available projects |
+| `specify project switch <id>` | Switch to a different project |
+| `specify project config` | Show current project configuration |
+| `specify migrate <name>` | Migrate existing single-project setup to multi-project |
+
+### Project Setup Examples
+
+```bash
+# Create first project with automatic range assignment (001-099)
+specify project init "BASB Manager" --name "BASB Manager"
+
+# Create second project with specific range (100-199)
+specify project init "Proxmox Manager" --id proxmox-manager --range-start 100 --range-end 199
+
+# Create third project with specific range (200-299)
+specify project init "Content Creator" --id content-creator --range-start 200 --range-end 299
+
+# List all projects
+specify project list
+
+# Switch to a specific project
+specify project switch basb-manager
+
+# Show current project configuration
+specify project config
+```
+
+### Migration from Single-Project
+
+If you have an existing single-project setup, you can migrate to multi-project:
+
+```bash
+# Dry run to see what would be migrated
+specify migrate "My Existing Project" --dry-run
+
+# Actual migration
+specify migrate "My Existing Project" --id my-project --range-start 1
+```
+
+### Directory Structure
+
+Multi-project setup organizes features by project:
+
+```
+repo-root/
+├── .specify/
+│   ├── projects/           # Project configurations
+│   │   ├── basb-manager.yaml
+│   │   ├── proxmox-manager.yaml
+│   │   └── content-creator.yaml
+│   ├── .current-project    # Current active project
+│   ├── templates/
+│   │   ├── projects/       # Project-specific templates
+│   │   │   ├── basb-manager/
+│   │   │   └── content-creator/
+│   │   └── spec-template.md
+│   └── scripts/
+├── specs/
+│   ├── basb-manager/      # Project-specific features
+│   │   ├── 001-user-auth/
+│   │   └── 002-api-integration/
+│   ├── proxmox-manager/
+│   │   ├── 100-vm-management/
+│   │   └── 101-backup-system/
+│   └── content-creator/
+│       ├── 200-media-upload/
+│       └── 201-content-processing/
+```
+
+### Feature Numbering
+
+Each project gets its own number range to prevent conflicts:
+
+- **BASB Manager**: 001-099
+- **Proxmox Manager**: 100-199  
+- **Content Creator**: 200-299
+- **Additional projects**: Auto-assigned in 100-number blocks
+
+### Template Resolution
+
+Templates are resolved with this priority:
+
+1. **Project-specific**: `.specify/templates/projects/<project-id>/spec-template.md`
+2. **Global fallback**: `.specify/templates/spec-template.md`
+
+### Environment Variables
+
+Multi-project adds these environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `SPECIFY_PROJECT` | Current project ID (set automatically) |
+| `SPECIFY_FEATURE` | Current feature branch name (existing behavior) |
 
 ## 📚 Core Philosophy
 

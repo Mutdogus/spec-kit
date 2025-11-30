@@ -80,6 +80,81 @@ find_repo_root() {
     return 1
 }
 
+# Function to detect current project context
+detect_project_context() {
+    local repo_root="$1"
+    local current_dir="$2"
+    
+    # Check for .specify/.current-project file
+    local current_project_file="$repo_root/.specify/.current-project"
+    if [ -f "$current_project_file" ]; then
+        local current_project=$(cat "$current_project_file" 2>/dev/null | tr -d '\n\r')
+        if [ -n "$current_project" ]; then
+            echo "$current_project"
+            return 0
+        fi
+    fi
+    
+    # Check if we're in a project-specific specs directory
+    local relative_path="${current_dir#$repo_root/}"
+    if [[ "$relative_path" == specs/* ]]; then
+        local potential_project=$(echo "$relative_path" | cut -d'/' -f2)
+        if [ -n "$potential_project" ] && [ -d "$repo_root/.specify/projects" ] && [ -f "$repo_root/.specify/projects/$potential_project.yaml" ]; then
+            echo "$potential_project"
+            return 0
+        fi
+    fi
+    
+    # Fallback: try to detect from existing specs structure
+    if [ -d "$repo_root/specs" ]; then
+        # Look for project-specific subdirectories
+        for subdir in "$repo_root/specs"/*; do
+            if [ -d "$subdir" ] && [ -f "$repo_root/.specify/projects/$(basename "$subdir").yaml" ]; then
+                echo "$(basename "$subdir")"
+                return 0
+            fi
+        done
+    fi
+    
+    return 1
+}
+
+# Function to get project configuration
+get_project_config() {
+    local repo_root="$1"
+    local project_id="$2"
+    local project_file="$repo_root/.specify/projects/$project_id.yaml"
+    
+    if [ ! -f "$project_file" ]; then
+        return 1
+    fi
+    
+    # Extract configuration values using simple parsing
+    # This is a basic YAML parser for our specific structure
+    local range_start=$(grep "^  range_start:" "$project_file" | sed 's/^  range_start: //' | tr -d ' ')
+    local range_end=$(grep "^  range_end:" "$project_file" | sed 's/^  range_end: //' | tr -d ' ')
+    local scheme=$(grep "^    scheme:" "$project_file" | sed 's/^    scheme: //' | tr -d ' ')
+    
+    # Set global variables for use by other functions
+    PROJECT_RANGE_START=${range_start:-1}
+    PROJECT_RANGE_END=${range_end:-999}
+    PROJECT_NUMBERING_SCHEME=${scheme:-"per-project"}
+    
+    return 0
+}
+
+# Function to get project-specific specs directory
+get_project_specs_dir() {
+    local repo_root="$1"
+    local project_id="$2"
+    
+    if [ -n "$project_id" ]; then
+        echo "$repo_root/specs/$project_id"
+    else
+        echo "$repo_root/specs"
+    fi
+}
+
 # Function to get highest number from specs directory
 get_highest_from_specs() {
     local specs_dir="$1"
@@ -130,12 +205,19 @@ get_highest_from_branches() {
 check_existing_branches() {
     local short_name="$1"
     local specs_dir="$2"
+    local project_id="$3"
     
     # Fetch all remotes to get latest branch info (suppress errors if no remotes)
     git fetch --all --prune 2>/dev/null || true
     
     # Find all branches matching the pattern using git ls-remote (more reliable)
-    local remote_branches=$(git ls-remote --heads origin 2>/dev/null | grep -E "refs/heads/[0-9]+-${short_name}$" | sed 's/.*\/\([0-9]*\)-.*/\1/' | sort -n)
+    local remote_branches=""
+    if [ -n "$project_id" ]; then
+        # For project-aware mode, only look for branches within the project's number range
+        remote_branches=$(git ls-remote --heads origin 2>/dev/null | grep -E "refs/heads/[0-9]+-${short_name}$" | sed 's/.*\/\([0-9]*\)-.*/\1/' | sort -n)
+    else
+        remote_branches=$(git ls-remote --heads origin 2>/dev/null | grep -E "refs/heads/[0-9]+-${short_name}$" | sed 's/.*\/\([0-9]*\)-.*/\1/' | sort -n)
+    fi
     
     # Also check local branches
     local local_branches=$(git branch 2>/dev/null | grep -E "^[* ]*[0-9]+-${short_name}$" | sed 's/^[* ]*//' | sed 's/-.*//' | sort -n)
@@ -149,13 +231,37 @@ check_existing_branches() {
     # Combine all sources and get the highest number
     local max_num=0
     for num in $remote_branches $local_branches $spec_dirs; do
-        if [ "$num" -gt "$max_num" ]; then
-            max_num=$num
+        # Filter by project range if project-aware
+        if [ -n "$project_id" ] && [ -n "$PROJECT_RANGE_START" ] && [ -n "$PROJECT_RANGE_END" ]; then
+            if [ "$num" -ge "$PROJECT_RANGE_START" ] && [ "$num" -le "$PROJECT_RANGE_END" ]; then
+                if [ "$num" -gt "$max_num" ]; then
+                    max_num=$num
+                fi
+            fi
+        else
+            if [ "$num" -gt "$max_num" ]; then
+                max_num=$num
+            fi
         fi
     done
     
-    # Return next number
-    echo $((max_num + 1))
+    # Return next number, respecting project range
+    if [ -n "$project_id" ] && [ -n "$PROJECT_RANGE_START" ]; then
+        # If no existing features in range, start from range start
+        if [ "$max_num" -lt "$PROJECT_RANGE_START" ]; then
+            echo "$PROJECT_RANGE_START"
+        else
+            local next_num=$((max_num + 1))
+            # Ensure we don't exceed the range
+            if [ "$next_num" -gt "$PROJECT_RANGE_END" ]; then
+                echo "Error: Project '$project_id' has exhausted its number range (${PROJECT_RANGE_START:03d}-${PROJECT_RANGE_END:03d})" >&2
+                exit 1
+            fi
+            echo "$next_num"
+        fi
+    else
+        echo $((max_num + 1))
+    fi
 }
 
 # Function to clean and format a branch name
@@ -183,7 +289,27 @@ fi
 
 cd "$REPO_ROOT"
 
-SPECS_DIR="$REPO_ROOT/specs"
+# Detect project context
+CURRENT_DIR="$REPO_ROOT"
+PROJECT_ID=$(detect_project_context "$REPO_ROOT" "$CURRENT_DIR")
+
+# Load project configuration if available
+if [ -n "$PROJECT_ID" ]; then
+    if get_project_config "$REPO_ROOT" "$PROJECT_ID"; then
+        printf "[specify] Using project: %s (range: %03d-%03d)\n" "$PROJECT_ID" "$PROJECT_RANGE_START" "$PROJECT_RANGE_END" >&2
+    else
+        echo "[specify] Warning: Could not load configuration for project '$PROJECT_ID'" >&2
+        PROJECT_ID=""
+    fi
+fi
+
+# Set specs directory based on project context
+if [ -n "$PROJECT_ID" ]; then
+    SPECS_DIR="$REPO_ROOT/specs/$PROJECT_ID"
+else
+    SPECS_DIR="$REPO_ROOT/specs"
+fi
+
 mkdir -p "$SPECS_DIR"
 
 # Function to generate branch name with stop word filtering and length filtering
@@ -246,12 +372,28 @@ fi
 # Determine branch number
 if [ -z "$BRANCH_NUMBER" ]; then
     if [ "$HAS_GIT" = true ]; then
-        # Check existing branches on remotes
-        BRANCH_NUMBER=$(check_existing_branches "$BRANCH_SUFFIX" "$SPECS_DIR")
+        # Check existing branches on remotes (project-aware)
+        BRANCH_NUMBER=$(check_existing_branches "$BRANCH_SUFFIX" "$SPECS_DIR" "$PROJECT_ID")
     else
-        # Fall back to local directory check
+        # Fall back to local directory check (project-aware)
         HIGHEST=$(get_highest_from_specs "$SPECS_DIR")
-        BRANCH_NUMBER=$((HIGHEST + 1))
+        
+        # Apply project range constraints if project-aware
+        if [ -n "$PROJECT_ID" ] && [ -n "$PROJECT_RANGE_START" ]; then
+            if [ "$HIGHEST" -lt "$PROJECT_RANGE_START" ]; then
+                BRANCH_NUMBER="$PROJECT_RANGE_START"
+            else
+                BRANCH_NUMBER=$((HIGHEST + 1))
+            fi
+            
+            # Ensure we don't exceed the range
+            if [ "$BRANCH_NUMBER" -gt "$PROJECT_RANGE_END" ]; then
+                echo "Error: Project '$PROJECT_ID' has exhausted its number range (${PROJECT_RANGE_START:03d}-${PROJECT_RANGE_END:03d})" >&2
+                exit 1
+            fi
+        else
+            BRANCH_NUMBER=$((HIGHEST + 1))
+        fi
     fi
 fi
 
@@ -288,18 +430,52 @@ fi
 FEATURE_DIR="$SPECS_DIR/$BRANCH_NAME"
 mkdir -p "$FEATURE_DIR"
 
-TEMPLATE="$REPO_ROOT/.specify/templates/spec-template.md"
+# Resolve template path with project-aware fallback
+TEMPLATE=""
+if [ -n "$PROJECT_ID" ]; then
+    # Check for project-specific template first
+    PROJECT_TEMPLATE="$REPO_ROOT/.specify/templates/projects/$PROJECT_ID/spec-template.md"
+    if [ -f "$PROJECT_TEMPLATE" ]; then
+        TEMPLATE="$PROJECT_TEMPLATE"
+    fi
+fi
+
+# Fall back to global template
+if [ -z "$TEMPLATE" ]; then
+    GLOBAL_TEMPLATE="$REPO_ROOT/.specify/templates/spec-template.md"
+    if [ -f "$GLOBAL_TEMPLATE" ]; then
+        TEMPLATE="$GLOBAL_TEMPLATE"
+    fi
+fi
+
 SPEC_FILE="$FEATURE_DIR/spec.md"
-if [ -f "$TEMPLATE" ]; then cp "$TEMPLATE" "$SPEC_FILE"; else touch "$SPEC_FILE"; fi
+if [ -f "$TEMPLATE" ]; then 
+    cp "$TEMPLATE" "$SPEC_FILE"
+    echo "[specify] Using template: $TEMPLATE" >&2
+else 
+    touch "$SPEC_FILE"
+    echo "[specify] Warning: No template found, created empty spec file" >&2
+fi
 
 # Set the SPECIFY_FEATURE environment variable for the current session
 export SPECIFY_FEATURE="$BRANCH_NAME"
+if [ -n "$PROJECT_ID" ]; then
+    export SPECIFY_PROJECT="$PROJECT_ID"
+fi
 
 if $JSON_MODE; then
-    printf '{"BRANCH_NAME":"%s","SPEC_FILE":"%s","FEATURE_NUM":"%s"}\n' "$BRANCH_NAME" "$SPEC_FILE" "$FEATURE_NUM"
+    if [ -n "$PROJECT_ID" ]; then
+        printf '{"BRANCH_NAME":"%s","SPEC_FILE":"%s","FEATURE_NUM":"%s","PROJECT_ID":"%s"}\n' "$BRANCH_NAME" "$SPEC_FILE" "$FEATURE_NUM" "$PROJECT_ID"
+    else
+        printf '{"BRANCH_NAME":"%s","SPEC_FILE":"%s","FEATURE_NUM":"%s"}\n' "$BRANCH_NAME" "$SPEC_FILE" "$FEATURE_NUM"
+    fi
 else
     echo "BRANCH_NAME: $BRANCH_NAME"
     echo "SPEC_FILE: $SPEC_FILE"
     echo "FEATURE_NUM: $FEATURE_NUM"
+    if [ -n "$PROJECT_ID" ]; then
+        echo "PROJECT_ID: $PROJECT_ID"
+        echo "SPECIFY_PROJECT environment variable set to: $PROJECT_ID"
+    fi
     echo "SPECIFY_FEATURE environment variable set to: $BRANCH_NAME"
 fi

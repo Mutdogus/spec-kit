@@ -59,6 +59,86 @@ function Find-RepositoryRoot {
     }
 }
 
+function Get-ProjectContext {
+    param(
+        [string]$RepoRoot,
+        [string]$CurrentDir
+    )
+    
+    # Check for .specify/.current-project file
+    $currentProjectFile = Join-Path $RepoRoot '.specify/.current-project'
+    if (Test-Path $currentProjectFile) {
+        $currentProject = Get-Content $currentProjectFile -Raw | ForEach-Object { $_.Trim() }
+        if ($currentProject) {
+            return $currentProject
+        }
+    }
+    
+    # Check if we're in a project-specific specs directory
+    $relativePath = $CurrentDir.Substring($RepoRoot.Length).TrimStart('\', '/')
+    if ($relativePath -match '^specs/([^/]+)') {
+        $potentialProject = $matches[1]
+        $projectFile = Join-Path $RepoRoot ".specify/projects/$potentialProject.yaml"
+        if (Test-Path $projectFile) {
+            return $potentialProject
+        }
+    }
+    
+    # Fallback: try to detect from existing specs structure
+    $specsDir = Join-Path $RepoRoot 'specs'
+    if (Test-Path $specsDir) {
+        $subdirs = Get-ChildItem -Path $specsDir -Directory | Where-Object {
+            $projectFile = Join-Path $RepoRoot ".specify/projects/$($_.Name).yaml"
+            Test-Path $projectFile
+        }
+        if ($subdirs.Count -gt 0) {
+            return $subdirs[0].Name
+        }
+    }
+    
+    return $null
+}
+
+function Get-ProjectConfig {
+    param(
+        [string]$RepoRoot,
+        [string]$ProjectId
+    )
+    
+    $projectFile = Join-Path $RepoRoot ".specify/projects/$ProjectId.yaml"
+    if (-not (Test-Path $projectFile)) {
+        return $null
+    }
+    
+    # Extract configuration values using simple parsing
+    # This is a basic YAML parser for our specific structure
+    $content = Get-Content $projectFile -Raw
+    
+    $rangeStart = if ($content -match 'range_start:\s*(\d+)') { [int]$matches[1] } else { 1 }
+    $rangeEnd = if ($content -match 'range_end:\s*(\d+)') { [int]$matches[1] } else { 999 }
+    $scheme = if ($content -match 'scheme:\s*(\w+)') { $matches[1] } else { "per-project" }
+    
+    # Return as a custom object
+    return [PSCustomObject]@{
+        RangeStart = $rangeStart
+        RangeEnd = $rangeEnd
+        Scheme = $scheme
+    }
+}
+
+function Get-ProjectSpecsDir {
+    param(
+        [string]$RepoRoot,
+        [string]$ProjectId
+    )
+    
+    if ($ProjectId) {
+        return Join-Path $RepoRoot "specs\$ProjectId"
+    } else {
+        return Join-Path $RepoRoot 'specs'
+    }
+}
+
 function Get-HighestNumberFromSpecs {
     param([string]$SpecsDir)
     
@@ -102,7 +182,9 @@ function Get-HighestNumberFromBranches {
 function Get-NextBranchNumber {
     param(
         [string]$ShortName,
-        [string]$SpecsDir
+        [string]$SpecsDir,
+        [string]$ProjectId = $null,
+        [object]$ProjectConfig = $null
     )
     
     # Fetch all remotes to get latest branch info (suppress errors if no remotes)
@@ -159,13 +241,37 @@ function Get-NextBranchNumber {
     # Combine all sources and get the highest number
     $maxNum = 0
     foreach ($num in ($remoteBranches + $localBranches + $specDirs)) {
-        if ($num -gt $maxNum) {
-            $maxNum = $num
+        # Filter by project range if project-aware
+        if ($ProjectId -and $ProjectConfig) {
+            if ($num -ge $ProjectConfig.RangeStart -and $num -le $ProjectConfig.RangeEnd) {
+                if ($num -gt $maxNum) {
+                    $maxNum = $num
+                }
+            }
+        } else {
+            if ($num -gt $maxNum) {
+                $maxNum = $num
+            }
         }
     }
     
-    # Return next number
-    return $maxNum + 1
+    # Return next number, respecting project range
+    if ($ProjectId -and $ProjectConfig) {
+        # If no existing features in range, start from range start
+        if ($maxNum -lt $ProjectConfig.RangeStart) {
+            return $ProjectConfig.RangeStart
+        } else {
+            $nextNum = $maxNum + 1
+            # Ensure we don't exceed the range
+            if ($nextNum -gt $ProjectConfig.RangeEnd) {
+                Write-Error "Project '$ProjectId' has exhausted its number range ($($ProjectConfig.RangeStart:000)-$($ProjectConfig.RangeEnd:000))"
+                exit 1
+            }
+            return $nextNum
+        }
+    } else {
+        return $maxNum + 1
+    }
 }
 
 function ConvertTo-CleanBranchName {
@@ -193,7 +299,24 @@ try {
 
 Set-Location $repoRoot
 
-$specsDir = Join-Path $repoRoot 'specs'
+# Detect project context
+$currentDir = Get-Location
+$projectId = Get-ProjectContext -RepoRoot $repoRoot -CurrentDir $currentDir
+
+# Load project configuration if available
+$projectConfig = $null
+if ($projectId) {
+    $projectConfig = Get-ProjectConfig -RepoRoot $repoRoot -ProjectId $projectId
+    if ($projectConfig) {
+        Write-Host "[specify] Using project: $projectId (range: $($projectConfig.RangeStart:000)-$($projectConfig.RangeEnd:000))" -ForegroundColor Yellow
+    } else {
+        Write-Warning "[specify] Warning: Could not load configuration for project '$projectId'"
+        $projectId = $null
+    }
+}
+
+# Set specs directory based on project context
+$specsDir = Get-ProjectSpecsDir -RepoRoot $repoRoot -ProjectId $projectId
 New-Item -ItemType Directory -Path $specsDir -Force | Out-Null
 
 # Function to generate branch name with stop word filtering and length filtering
@@ -253,11 +376,28 @@ if ($ShortName) {
 # Determine branch number
 if ($Number -eq 0) {
     if ($hasGit) {
-        # Check existing branches on remotes
-        $Number = Get-NextBranchNumber -ShortName $branchSuffix -SpecsDir $specsDir
+        # Check existing branches on remotes (project-aware)
+        $Number = Get-NextBranchNumber -ShortName $branchSuffix -SpecsDir $specsDir -ProjectId $projectId -ProjectConfig $projectConfig
     } else {
-        # Fall back to local directory check
-        $Number = (Get-HighestNumberFromSpecs -SpecsDir $specsDir) + 1
+        # Fall back to local directory check (project-aware)
+        $highest = Get-HighestNumberFromSpecs -SpecsDir $specsDir
+        
+        # Apply project range constraints if project-aware
+        if ($projectId -and $projectConfig) {
+            if ($highest -lt $projectConfig.RangeStart) {
+                $Number = $projectConfig.RangeStart
+            } else {
+                $Number = $highest + 1
+            }
+            
+            # Ensure we don't exceed the range
+            if ($Number -gt $projectConfig.RangeEnd) {
+                Write-Error "Project '$projectId' has exhausted its number range ($($projectConfig.RangeStart:000)-$($projectConfig.RangeEnd:000))"
+                exit 1
+            }
+        } else {
+            $Number = $highest + 1
+        }
     }
 }
 
@@ -298,22 +438,45 @@ if ($hasGit) {
 $featureDir = Join-Path $specsDir $branchName
 New-Item -ItemType Directory -Path $featureDir -Force | Out-Null
 
-$template = Join-Path $repoRoot '.specify/templates/spec-template.md'
+# Resolve template path with project-aware fallback
+$template = $null
+if ($projectId) {
+    # Check for project-specific template first
+    $projectTemplate = Join-Path $repoRoot ".specify/templates/projects/$projectId/spec-template.md"
+    if (Test-Path $projectTemplate) {
+        $template = $projectTemplate
+    }
+}
+
+# Fall back to global template
+if (-not $template) {
+    $globalTemplate = Join-Path $repoRoot '.specify/templates/spec-template.md'
+    if (Test-Path $globalTemplate) {
+        $template = $globalTemplate
+    }
+}
+
 $specFile = Join-Path $featureDir 'spec.md'
-if (Test-Path $template) { 
+if ($template) { 
     Copy-Item $template $specFile -Force 
+    Write-Host "[specify] Using template: $template" -ForegroundColor Yellow
 } else { 
     New-Item -ItemType File -Path $specFile | Out-Null 
+    Write-Warning "[specify] Warning: No template found, created empty spec file"
 }
 
 # Set the SPECIFY_FEATURE environment variable for the current session
 $env:SPECIFY_FEATURE = $branchName
+if ($projectId) {
+    $env:SPECIFY_PROJECT = $projectId
+}
 
 if ($Json) {
     $obj = [PSCustomObject]@{ 
         BRANCH_NAME = $branchName
         SPEC_FILE = $specFile
         FEATURE_NUM = $featureNum
+        PROJECT_ID = $projectId
         HAS_GIT = $hasGit
     }
     $obj | ConvertTo-Json -Compress
@@ -321,6 +484,10 @@ if ($Json) {
     Write-Output "BRANCH_NAME: $branchName"
     Write-Output "SPEC_FILE: $specFile"
     Write-Output "FEATURE_NUM: $featureNum"
+    if ($projectId) {
+        Write-Output "PROJECT_ID: $projectId"
+        Write-Output "SPECIFY_PROJECT environment variable set to: $projectId"
+    }
     Write-Output "HAS_GIT: $hasGit"
     Write-Output "SPECIFY_FEATURE environment variable set to: $branchName"
 }
